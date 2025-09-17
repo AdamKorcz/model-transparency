@@ -52,6 +52,7 @@ from model_signing._signing import sign_certificate as certificate
 from model_signing._signing import sign_ec_key as ec_key
 from model_signing._signing import sign_sigstore as sigstore
 from model_signing._signing import signing
+from sigstore._internal.trust import TrustedRoot
 
 
 if sys.version_info >= (3, 11):
@@ -128,6 +129,7 @@ class Config:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         for_fuzzing: bool = False,
+        trusted_root_for_fuzzing: TrustedRoot = None,
     ) -> Self:
         """Configures the signing to be performed with Sigstore.
 
@@ -175,6 +177,7 @@ class Config:
             client_id=client_id,
             client_secret=client_secret,
             for_fuzzing=for_fuzzing,
+            trusted_root_for_fuzzing=trusted_root_for_fuzzing,
         )
         return self
 

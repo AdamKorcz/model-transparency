@@ -77,6 +77,7 @@ class Signer(signing.Signer):
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
         for_fuzzing: bool = False,
+        trusted_root_for_fuzzing: TrustedRoot = None,
     ):
         """Initializes Sigstore signers.
 
@@ -116,7 +117,7 @@ class Signer(signing.Signer):
             self._signing_context = sigstore_signer.SigningContext(
                 fulcio=FulcioClient.staging(),
                 rekor=RekorClient.staging(),
-                trusted_root=TrustedRoot.staging(offline=True),
+                trusted_root=trusted_root_for_fuzzing,
             )
             self._issuer = sigstore_oidc.Issuer.staging()
         elif use_staging:

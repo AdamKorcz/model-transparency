@@ -15,6 +15,8 @@ import atheris
 from utils import any_files
 from utils import create_fuzz_files
 from model_signing import signing, verifying
+from sigstore._internal import tuf
+from sigstore._internal.trust import TrustedRoot
 
 
 EXPECTED_IDENTITY = (
@@ -59,11 +61,43 @@ def sigstore_oidc_beacon_token() -> str:
     secret = b"offline-fuzzing-secret-key"
     return _jwt_hs256(payload, secret)
 
+def tuf_dirs(tmp_path):
+    # Patch _get_dirs as well, to avoid polluting the user's actual cache
+    # with test assets.
+    data_dir = tmp_path / "data" / "tuf"
+    cache_dir = tmp_path / "cache" / "tuf"
+    return data_dir, cache_dir
+
+tuf._get_dirs = tuf_dirs
 
 # ---- Atheris harness ---------------------------------------------------------
 
 def TestOneInput(data: bytes) -> None:
     fdp = atheris.FuzzedDataProvider(data)
+
+    root_bytes_size = fdp.ConsumeIntInRange(0, 10000)
+    root_bytes = fdp.ConsumeBytes(root_bytes_size)
+
+    trusted_root = None  # Declare root so it's accessible outside try/finally
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    try:
+        # Write bytes to file
+        with open(path, "wb") as f:
+            f.write(root_bytes)
+
+        # Attempt to load TrustedRoot
+        try:
+            trusted_root = TrustedRoot.from_file(path)
+            print("TrustedRoot created")
+        except Exception as e:
+            print("Error creating TrustedRoot:", e)
+            return
+    finally:
+        # Always clean up
+        if os.path.exists(path):
+            os.remove(path)
 
     with tempfile.TemporaryDirectory(prefix="fuzz-sigstore-") as tmpdir:
         print("creating files....")
@@ -80,9 +114,9 @@ def TestOneInput(data: bytes) -> None:
 
         sc = signing.Config()
         sc.use_sigstore_signer(
-            use_staging=True,
             identity_token=identity_token,
             for_fuzzing=True,
+            trusted_root_for_fuzzing=trusted_root_for_fuzzing,
         )
  
         signature_path = os.path.join(tmpdir, "model.sig")
