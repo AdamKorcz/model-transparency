@@ -19,6 +19,9 @@ import sys
 from typing import Optional, cast
 
 from google.protobuf import json_format
+from sigstore._internal.rekor.client import RekorClient
+from sigstore._internal.trust import TrustedRoot
+from sigstore._internal.fulcio import FulcioClient
 from sigstore import dsse as sigstore_dsse
 from sigstore import models as sigstore_models
 from sigstore import oidc as sigstore_oidc
@@ -73,6 +76,7 @@ class Signer(signing.Signer):
         force_oob: bool = False,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
+        for_fuzzing: bool = False,
     ):
         """Initializes Sigstore signers.
 
@@ -108,7 +112,14 @@ class Signer(signing.Signer):
               that the client is public or the provider does not require a
               secret.
         """
-        if use_staging:
+        if for_fuzzing:
+            self._signing_context = sigstore_signer.SigningContext(
+                fulcio=FulcioClient.staging(),
+                rekor=RekorClient.staging(),
+                trusted_root=TrustedRoot.staging(offline=True),
+            )
+            self._issuer = sigstore_oidc.Issuer.staging()
+        elif use_staging:
             trust_config = sigstore_models.ClientTrustConfig.staging()
         else:
             trust_config = sigstore_models.ClientTrustConfig.production()

@@ -127,6 +127,7 @@ class Config:
         identity_token: Optional[str] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
+        for_fuzzing: bool = False,
     ) -> Self:
         """Configures the signing to be performed with Sigstore.
 
@@ -173,6 +174,7 @@ class Config:
             force_oob=force_oob,
             client_id=client_id,
             client_secret=client_secret,
+            for_fuzzing=for_fuzzing,
         )
         return self
 
