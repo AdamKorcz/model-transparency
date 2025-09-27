@@ -52,7 +52,7 @@ from model_signing._signing import sign_certificate as certificate
 from model_signing._signing import sign_ec_key as ec_key
 from model_signing._signing import sign_sigstore as sigstore
 from model_signing._signing import signing
-from sigstore._internal.trust import TrustedRoot
+from sigstore.models import TrustedRoot
 
 
 if sys.version_info >= (3, 11):

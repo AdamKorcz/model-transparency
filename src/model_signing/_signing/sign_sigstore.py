@@ -20,7 +20,7 @@ from typing import Optional, cast
 
 from google.protobuf import json_format
 from sigstore._internal.rekor.client import RekorClient
-from sigstore._internal.trust import TrustedRoot
+from sigstore.models import TrustedRoot
 from sigstore._internal.fulcio import FulcioClient
 from sigstore import dsse as sigstore_dsse
 from sigstore import models as sigstore_models

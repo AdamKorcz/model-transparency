@@ -16,7 +16,7 @@ from utils import any_files
 from utils import create_fuzz_files
 from model_signing import signing, verifying
 from sigstore._internal import tuf
-from sigstore._internal.trust import TrustedRoot
+from sigstore.models import TrustedRoot
 
 
 EXPECTED_IDENTITY = (
