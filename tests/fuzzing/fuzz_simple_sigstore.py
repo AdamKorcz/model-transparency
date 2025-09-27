@@ -4,13 +4,43 @@ import json
 import base64
 import tempfile
 import os
+import hmac
+import hashlib
+import time
 
+from utils import any_files
+from utils import create_fuzz_files
+from model_signing import signing, verifying
+
+from pathlib import Path
 from sigstore.models import TrustedRoot  # type: ignore
 
 import atheris
 
+EXPECTED_IDENTITY = (
+    "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/"
+    ".github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main"
+)
+EXPECTED_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 
 # ---------------------------- helpers ----------------------------
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_json(obj: dict) -> str:
+    return _b64url(json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+
+
+def _jwt_hs256(payload: dict, secret: bytes) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = _b64url_json(header)
+    payload_b64 = _b64url_json(payload)
+    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    sig_b64 = _b64url(sig)
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
 
 def maybe(fdp, p=0.5) -> bool:
     # True ~p% of the time
@@ -167,6 +197,20 @@ def make_trusted_root_json(fdp):
     # Dump compact to keep inputs small; ensure_ascii to stay ASCII-safe.
     return json.dumps(root, separators=(",", ":"), ensure_ascii=True)
 
+def sigstore_oidc_beacon_token() -> str:
+    """Offline replacement for the fixture in tests/api_test.py."""
+    now = int(time.time())
+    payload = {
+        "iss": EXPECTED_OIDC_ISSUER,
+        "sub": EXPECTED_IDENTITY,
+        "aud": "sigstore",
+        "iat": now - 10,
+        "nbf": now - 10,
+        "exp": now + 3600,
+        "jti": f"fuzz-{now}",
+    }
+    secret = b"offline-fuzzing-secret-key"
+    return _jwt_hs256(payload, secret)
 
 # ---------------------------- fuzz target ----------------------------
 
@@ -183,6 +227,7 @@ def TestOneInput(data: bytes) -> None:
     # Write ONLY the JSON (no size prefix) and try parsing with sigstore.
     # If the library raises (value error / validation), swallow it so we can keep fuzzing.
     tf = None
+    tr = None
     try:
         tf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".json")
         tf.write(json_text)
@@ -190,7 +235,7 @@ def TestOneInput(data: bytes) -> None:
         tf.close()
 
         try:
-            TrustedRoot.from_file(tf.name)  # target under test
+            tr = TrustedRoot.from_file(tf.name)  # target under test
         except Exception:
             # Validation failures are expected; ignore to keep exploring.
             return
@@ -201,7 +246,44 @@ def TestOneInput(data: bytes) -> None:
                 os.unlink(tf.name)
             except OSError:
                 pass
-    print("DID IT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+    with (
+        tempfile.TemporaryDirectory(prefix="mt_file_fuzz_") as tmpdir,
+        tempfile.TemporaryDirectory(prefix="mt_sig_fuzz_") as sigdir,
+    ):
+        root = Path(tmpdir)
+        create_fuzz_files(root, fdp)
+        # If there are NO files in root (skip empty directory cases).
+        if not any_files(root):
+            return
+
+        print("DID IT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        identity_token = sigstore_oidc_beacon_token()
+        sc = signing.Config()
+        sc.use_sigstore_signer(
+            identity_token=identity_token,
+            for_fuzzing=True,
+            trusted_root_for_fuzzing=tr,
+        )
+ 
+        signature_path = os.path.join(tmpdir, "model.sig")
+        print("signing")
+        try:
+            sc.sign(model_path, signature_path)
+        except Exception as e:
+            print(e)
+            return
+
+        '''try:
+            print("verifying")
+            verifying.Config().use_sigstore_verifier(
+                identity=EXPECTED_IDENTITY,
+                oidc_issuer=EXPECTED_OIDC_ISSUER,
+                use_staging=True,
+            ).verify(model_path, signature_path)
+        except Exception as e:
+            print(e)
+            pass'''
 
 
 def main():
