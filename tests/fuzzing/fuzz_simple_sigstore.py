@@ -98,6 +98,7 @@ def TestOneInput(data: bytes) -> None:
         # Always clean up
         if os.path.exists(path):
             os.remove(path)
+    raise Exception("Created a TrustedRoot")
 
     with tempfile.TemporaryDirectory(prefix="fuzz-sigstore-") as tmpdir:
         print("creating files....")
