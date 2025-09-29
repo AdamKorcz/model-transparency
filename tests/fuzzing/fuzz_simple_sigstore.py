@@ -14,6 +14,7 @@ from model_signing import signing, verifying
 
 from pathlib import Path
 from sigstore.models import TrustedRoot  # type: ignore
+from model_signing._signing import sign_sigstore as sigstore
 
 import atheris
 
@@ -258,18 +259,20 @@ def TestOneInput(data: bytes) -> None:
             return
 
         print("DID IT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        identity_token = sigstore_oidc_beacon_token()
-        sc = signing.Config()
-        sc.use_sigstore_signer(
-            identity_token=identity_token,
-            for_fuzzing=True,
-            trusted_root_for_fuzzing=tr,
-        )
+        #identity_token = sigstore_oidc_beacon_token()
+        #sc = signing.Config()
+        #sc.use_sigstore_signer(
+        #    identity_token=identity_token,
+        #    for_fuzzing=True,
+        #    trusted_root_for_fuzzing=tr,
+        #)
+        signer = sigstore.Signer()
  
         signature_path = os.path.join(tmpdir, "model.sig")
         print("signing")
         try:
-            sc.sign(model_path, signature_path)
+            #sc.sign(model_path, signature_path)
+            signer.sign(model_path, signature_path)
         except Exception as e:
             print(e)
             return

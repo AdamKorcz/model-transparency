@@ -115,7 +115,7 @@ class Signer(signing.Signer):
         """
         if for_fuzzing:
             self._signing_context = sigstore_signer.SigningContext(
-                fulcio=FulcioClient(),
+                fulcio=FulcioClient(url="xxx.com"),
                 rekor=RekorClient.staging(),
                 trusted_root=trusted_root_for_fuzzing,
             )
