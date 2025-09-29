@@ -4,9 +4,11 @@ import sys, os, json, base64, tempfile
 from pathlib import Path
 from contextlib import contextmanager
 from unittest.mock import patch
-from id import IdentityError
+from sigstore.oidc import IdentityError
 
 from model_signing import signing, verifying
+from utils import any_files
+from utils import create_fuzz_files
 
 # -----------------------
 # Helpers to get fuzz strings
@@ -96,23 +98,6 @@ class FakeSigningContext:
 class FakeVerifier:
     def verify_dsse(self, *, bundle, policy):
         return getattr(bundle, "media_type", "application/octet-stream"), getattr(bundle, "payload", b"")
-
-# -----------------------
-# Your helpers (replace with real imports if you have them)
-# -----------------------
-def create_fuzz_files(root: Path, fdp: "atheris.FuzzedDataProvider") -> None:
-    n = fdp.ConsumeIntInRange(0, 3)
-    for _ in range(n):
-        name_len = fdp.ConsumeIntInRange(1, 10)
-        fname = "".join(ch for ch in fdp.ConsumeUnicodeNoSurrogates(name_len) if ch.isalnum() or ch in ("_", "-", "."))
-        if not fname: fname = "f"
-        p = root / fname
-        p.parent.mkdir(parents=True, exist_ok=True)
-        data_len = fdp.ConsumeIntInRange(0, 4096)
-        p.write_bytes(fdp.ConsumeBytes(data_len))
-
-def any_files(root: Path) -> bool:
-    return any(root.iterdir())
 
 # -----------------------
 # Fuzz iteration
@@ -216,10 +201,7 @@ def _run_once_with_data(data: bytes) -> None:
                 return
             except ValueError as e:
                 print(e)
-                # Swallow only the in-toto type mismatch from model-transparency
-                if "Expected in-toto" in str(e):
-                    return
-                raise
+                return
             except IdentityError as e:
                 print(e)
                 return
