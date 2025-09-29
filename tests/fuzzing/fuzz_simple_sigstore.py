@@ -287,7 +287,7 @@ def TestOneInput(data: bytes) -> None:
 
 
 def main():
-    atheris.instrument_all()
+    #atheris.instrument_all()
     atheris.Setup(sys.argv, TestOneInput)
     atheris.Fuzz()
 
