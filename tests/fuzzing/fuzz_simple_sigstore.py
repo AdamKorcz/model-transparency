@@ -1,300 +1,253 @@
-#!/usr/bin/env python3
-import sys
-import json
-import base64
-import tempfile
-import os
-import hmac
-import hashlib
-import time
+# fuzz_sigstore_offline_test.py
+import atheris  # type: ignore
+import sys, os, json, base64, tempfile
+from pathlib import Path
+from contextlib import contextmanager
+from unittest.mock import patch
+from id import IdentityError
 
-from utils import any_files
-from utils import create_fuzz_files
 from model_signing import signing, verifying
 
-from pathlib import Path
-from sigstore.models import TrustedRoot  # type: ignore
-from model_signing._signing import sign_sigstore as sigstore
-
-import atheris
-
-EXPECTED_IDENTITY = (
-    "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/"
-    ".github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main"
-)
-EXPECTED_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
-
-# ---------------------------- helpers ----------------------------
-
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
-
-def _b64url_json(obj: dict) -> str:
-    return _b64url(json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-
-
-def _jwt_hs256(payload: dict, secret: bytes) -> str:
-    header = {"alg": "HS256", "typ": "JWT"}
-    header_b64 = _b64url_json(header)
-    payload_b64 = _b64url_json(payload)
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
-    sig_b64 = _b64url(sig)
-    return f"{header_b64}.{payload_b64}.{sig_b64}"
-
-def maybe(fdp, p=0.5) -> bool:
-    # True ~p% of the time
-    return fdp.ConsumeIntInRange(0, 999) < int(p * 1000)
-
-def rand_len(fdp, lo: int, hi: int) -> int:
-    return fdp.ConsumeIntInRange(lo, hi)
-
-def rand_unicode(fdp, max_len: int = 64) -> str:
-    n = rand_len(fdp, 0, max_len)
-    # Surrogate-free = safe for JSON
+# -----------------------
+# Helpers to get fuzz strings
+# -----------------------
+def fuzz_str(fdp, n):
+    # Prefer ConsumeString; fall back if not present.
     try:
+        return fdp.ConsumeString(n)
+    except AttributeError:
         return fdp.ConsumeUnicodeNoSurrogates(n)
+
+# -----------------------
+# Fakes (offline)
+# -----------------------
+def _extract_payload_from_statement(statement) -> bytes:
+    for attr in ("payload", "_payload", "content", "data", "body", "bytes"):
+        if hasattr(statement, attr):
+            v = getattr(statement, attr)
+            if isinstance(v, (bytes, bytearray)): return bytes(v)
+            if isinstance(v, str):
+                try: return base64.b64decode(v, validate=False)
+                except Exception: return v.encode("utf-8", "ignore")
+    for getter in ("json", "to_json"):
+        if hasattr(statement, getter):
+            try:
+                s = getattr(statement, getter)()
+                if isinstance(s, (bytes, bytearray)): s = s.decode("utf-8", "ignore")
+                obj = json.loads(s)
+                if isinstance(obj.get("payload"), str):
+                    try: return base64.b64decode(obj["payload"], validate=False)
+                    except Exception: return obj["payload"].encode("utf-8","ignore")
+                if isinstance(obj.get("payload_b64"), str):
+                    return base64.b64decode(obj["payload_b64"], validate=False)
+            except Exception:
+                pass
+    try:
+        s = str(statement)
+        if '"payload"' in s:
+            try:
+                obj = json.loads(s)
+                if isinstance(obj.get("payload"), str):
+                    return base64.b64decode(obj["payload"], validate=False)
+            except Exception:
+                pass
+        return s.encode("utf-8", "ignore")
     except Exception:
-        # Fallback if provider runs out
-        return ""
+        return b""
 
-def rand_ascii_token(fdp, max_len: int = 32) -> str:
-    # Slightly narrower alphabet to get URL-ish tokens
-    n = rand_len(fdp, 0, max_len)
-    s = []
+def _extract_media_type_from_statement(statement) -> str:
+    for attr in ("payload_type","_payload_type","payloadType","type","media_type","mediaType"):
+        if hasattr(statement, attr):
+            v = getattr(statement, attr)
+            if isinstance(v, str) and v: return v
+    return "application/vnd.in-toto+json"
+
+class FakeBundle:
+    def __init__(self, media_type: str, payload: bytes):
+        self.media_type = media_type
+        self.payload = payload
+    def to_json(self) -> str:
+        return json.dumps({
+            "mediaType": self.media_type,
+            "payloadB64": base64.b64encode(self.payload).decode("utf-8"),
+        })
+    @classmethod
+    def from_json(cls, s: str) -> "FakeBundle":
+        obj = json.loads(s)
+        mt = obj.get("mediaType", "application/octet-stream")
+        p64 = obj.get("payloadB64", "")
+        try: payload = base64.b64decode(p64, validate=False)
+        except Exception: payload = b""
+        return cls(mt, payload)
+
+class _FakeSigner:
+    def sign_dsse(self, statement):
+        return FakeBundle(
+            media_type=_extract_media_type_from_statement(statement),
+            payload=_extract_payload_from_statement(statement),
+        )
+
+class FakeSigningContext:
+    def signer(self, token):
+        @contextmanager
+        def _cm(): yield _FakeSigner()
+        return _cm()
+
+class FakeVerifier:
+    def verify_dsse(self, *, bundle, policy):
+        return getattr(bundle, "media_type", "application/octet-stream"), getattr(bundle, "payload", b"")
+
+# -----------------------
+# Your helpers (replace with real imports if you have them)
+# -----------------------
+def create_fuzz_files(root: Path, fdp: "atheris.FuzzedDataProvider") -> None:
+    n = fdp.ConsumeIntInRange(0, 3)
     for _ in range(n):
-        # letters, digits, dash, underscore
-        c = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
-        s.append(c[fdp.ConsumeIntInRange(0, len(c) - 1)])
-    return "".join(s)
+        name_len = fdp.ConsumeIntInRange(1, 10)
+        fname = "".join(ch for ch in fdp.ConsumeUnicodeNoSurrogates(name_len) if ch.isalnum() or ch in ("_", "-", "."))
+        if not fname: fname = "f"
+        p = root / fname
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data_len = fdp.ConsumeIntInRange(0, 4096)
+        p.write_bytes(fdp.ConsumeBytes(data_len))
 
-def rand_base64(fdp, max_src_len: int = 512) -> str:
-    n = rand_len(fdp, 0, max_src_len)
-    raw = fdp.ConsumeBytes(n)
-    return base64.b64encode(raw).decode("ascii")
+def any_files(root: Path) -> bool:
+    return any(root.iterdir())
 
-def rand_iso8601(fdp) -> str:
-    year = fdp.ConsumeIntInRange(1970, 2050)
-    month = fdp.ConsumeIntInRange(1, 12)
-    # keep it simple to avoid invalid dates
-    day = fdp.ConsumeIntInRange(1, 28)
-    hour = fdp.ConsumeIntInRange(0, 23)
-    minute = fdp.ConsumeIntInRange(0, 59)
-    second = fdp.ConsumeIntInRange(0, 59)
-    ms = fdp.ConsumeIntInRange(0, 999)
-    if maybe(fdp, 0.5):
-        return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}Z"
-    else:
-        return f"{year:04d}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}.{ms:03d}Z"
-
-def rand_url(fdp) -> str:
-    scheme = "https" if maybe(fdp, 0.8) else "http"
-    host = f"{rand_ascii_token(fdp, 8)}.{rand_ascii_token(fdp, 3) or 'dev'}"
-    if maybe(fdp, 0.5):
-        host = f"{rand_ascii_token(fdp, 5) or 'api'}.{host}"
-    path = ""
-    for _ in range(fdp.ConsumeIntInRange(0, 3)):
-        seg = rand_ascii_token(fdp, 10)
-        path += f"/{seg}" if seg else ""
-    return f"{scheme}://{host}{path or ''}"
-
-def pick(fdp, options):
-    return options[fdp.ConsumeIntInRange(0, len(options) - 1)]
-
-def make_validfor(fdp):
-    d = {"start": rand_iso8601(fdp)}
-    if maybe(fdp, 0.6):
-        d["end"] = rand_iso8601(fdp)
-    return d
-
-def make_public_key(fdp):
-    key_details_choices = [
-        "PKIX_ECDSA_P256_SHA_256",
-        "PKIX_ECDSA_P384_SHA_384",
-        "PKIX_RSA_PKCS1_2048_SHA_256",
-        "UNKNOWN_" + rand_ascii_token(fdp, 8),
-    ]
-    return {
-        "rawBytes": rand_base64(fdp, 200),  # DER-ish, but fuzz
-        "keyDetails": pick(fdp, key_details_choices) if maybe(fdp, 0.7) else rand_unicode(fdp, 40),
-        "validFor": make_validfor(fdp) if maybe(fdp, 0.8) else {"start": rand_iso8601(fdp)},
-    }
-
-def make_log_id(fdp):
-    # KeyId is usually a digest; base64 a random 32..64 bytes
-    n = fdp.ConsumeIntInRange(16, 64)
-    return {"keyId": base64.b64encode(fdp.ConsumeBytes(n)).decode("ascii")}
-
-def make_tlog(fdp):
-    hash_alg_choices = ["SHA2_256", "SHA2_512", "SHA1", rand_unicode(fdp, 16)]
-    return {
-        "baseUrl": rand_url(fdp),
-        "hashAlgorithm": pick(fdp, hash_alg_choices),
-        "publicKey": make_public_key(fdp),
-        "logId": make_log_id(fdp),
-    }
-
-def make_certificate(fdp):
-    # Just one field in this schema: rawBytes (base64 DER)
-    # Use 200..1600 bytes to resemble cert sizes (but fuzzed).
-    n = fdp.ConsumeIntInRange(0, 4)
-    size = [180, 400, 800, 1400, 0][n] if maybe(fdp, 0.7) else fdp.ConsumeIntInRange(0, 1600)
-    return {"rawBytes": base64.b64encode(fdp.ConsumeBytes(size)).decode("ascii")}
-
-def make_cert_chain(fdp):
-    count = fdp.ConsumeIntInRange(0, 20)
-    return {"certificates": [make_certificate(fdp) for _ in range(count)]}
-
-def make_subject(fdp):
-    return {
-        "organization": rand_unicode(fdp, 32),
-        "commonName": rand_unicode(fdp, 32),
-    }
-
-def make_certificate_authority(fdp):
-    return {
-        "subject": make_subject(fdp),
-        "uri": rand_url(fdp),
-        "certChain": make_cert_chain(fdp),
-        "validFor": make_validfor(fdp),
-    }
-
-def make_ctlog(fdp):
-    hash_alg_choices = ["SHA2_256", "SHA2_512", rand_unicode(fdp, 10)]
-    return {
-        "baseUrl": rand_url(fdp),
-        "hashAlgorithm": pick(fdp, hash_alg_choices),
-        "publicKey": make_public_key(fdp),
-        "logId": make_log_id(fdp),
-    }
-
-def make_timestamp_authority(fdp):
-    return {
-        "subject": make_subject(fdp),
-        "uri": rand_url(fdp),
-        "certChain": make_cert_chain(fdp),
-        "validFor": make_validfor(fdp),
-    }
-
-def make_trusted_root_json(fdp):
-    # Sometimes use the expected mediaType to get "deep" parses
-    media_type = (
-        "application/vnd.dev.sigstore.trustedroot+json;version=0.1"
-        if maybe(fdp, 0.6)
-        else rand_unicode(fdp, 60)
-    )
-    tlogs = [make_tlog(fdp) for _ in range(fdp.ConsumeIntInRange(0, 20))]
-    cas = [make_certificate_authority(fdp) for _ in range(fdp.ConsumeIntInRange(0, 20))]
-    ctlogs = [make_ctlog(fdp) for _ in range(fdp.ConsumeIntInRange(0, 20))]
-    tsas = [make_timestamp_authority(fdp) for _ in range(fdp.ConsumeIntInRange(0, 20))]
-    root = {
-        "mediaType": media_type,
-        "tlogs": tlogs,
-        "certificateAuthorities": cas,
-        "ctlogs": ctlogs,
-        "timestampAuthorities": tsas,
-    }
-    # Dump compact to keep inputs small; ensure_ascii to stay ASCII-safe.
-    return json.dumps(root, separators=(",", ":"), ensure_ascii=True)
-
-def sigstore_oidc_beacon_token() -> str:
-    """Offline replacement for the fixture in tests/api_test.py."""
-    now = int(time.time())
-    payload = {
-        "iss": EXPECTED_OIDC_ISSUER,
-        "sub": EXPECTED_IDENTITY,
-        "aud": "sigstore",
-        "iat": now - 10,
-        "nbf": now - 10,
-        "exp": now + 3600,
-        "jti": f"fuzz-{now}",
-    }
-    secret = b"offline-fuzzing-secret-key"
-    return _jwt_hs256(payload, secret)
-
-# ---------------------------- fuzz target ----------------------------
-
-def TestOneInput(data: bytes) -> None:
+# -----------------------
+# Fuzz iteration
+# -----------------------
+def _run_once_with_data(data: bytes) -> None:
     fdp = atheris.FuzzedDataProvider(data)
 
-    # Build the JSON string from fuzz data.
-    try:
-        json_text = make_trusted_root_json(fdp)
-    except Exception:
-        # If we fail to construct JSON (e.g., provider exhausted), bail out quietly.
-        return
+    # Fuzzed strings used by mocks
+    issuer_token = fuzz_str(fdp, 64)
+    ambient_token = fuzz_str(fdp, 64)
+    oidc_url_str  = fuzz_str(fdp, 64)
+    identity_hint = fuzz_str(fdp, 48)
 
-    # Write ONLY the JSON (no size prefix) and try parsing with sigstore.
-    # If the library raises (value error / validation), swallow it so we can keep fuzzing.
-    tf = None
-    tr = None
-    try:
-        tf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".json")
-        tf.write(json_text)
-        tf.flush()
-        tf.close()
+    # Temp store for read_embedded()
+    embedded_store = tempfile.TemporaryDirectory(prefix="sigstore_store_")
 
-        try:
-            tr = TrustedRoot.from_file(tf.name)  # target under test
-        except Exception:
-            # Validation failures are expected; ignore to keep exploring.
-            return
+    # Stub read_embedded(): return bytes from a temp file; seed with fuzzed bytes
+    def fake_read_embedded(name: str, url: str) -> bytes:
+        from urllib import parse
+        base = Path(embedded_store.name)
+        embed_dir = parse.quote(url, safe="")
+        path = base / embed_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            size = fdp.ConsumeIntInRange(0, 2048)
+            path.write_bytes(fdp.ConsumeBytes(size))
+        return path.read_bytes()
+
+    # Fake Issuer factory that returns a fuzzed token
+    def make_fake_issuer(token: str):
+        class _FakeIssuer:
+            def __init__(self, base_url: str) -> None:
+                self.base_url = base_url
+            def identity_token(self, *, force_oob: bool, client_id: str | None, client_secret: str | None):
+                return token  # <-- fuzzed
+        return _FakeIssuer
+
+    # ClientTrustConfig stub that returns a fuzzed OIDC URL
+    def make_stub_client_trust_config(url_value: str):
+        class _StubSigningCfg:
+            def get_oidc_url(self) -> str:
+                return url_value  # <-- fuzzed
+        class _StubClientTrustConfig:
+            def __init__(self): self.signing_config = _StubSigningCfg()
+        return _StubClientTrustConfig
+
+    # Optionally exercise the ambient credential path
+    use_ambient = bool(fdp.ConsumeIntInRange(0, 1))
+
+    # All patches MUST be active before constructing signer/verifier configs
+    StubCfg = make_stub_client_trust_config(oidc_url_str)
+    patch_specs = [
+        ("sigstore._utils.read_embedded", fake_read_embedded),
+        ("model_signing._signing.sign_sigstore.sigstore_oidc.Issuer", make_fake_issuer(issuer_token)),
+        ("model_signing._signing.sign_sigstore.sigstore_oidc.detect_credential",
+         (lambda: ambient_token) if use_ambient else (lambda: None)),
+        ("model_signing._signing.sign_sigstore.sigstore_signer.SigningContext.from_trust_config",
+         lambda *_a, **_k: FakeSigningContext()),
+        ("model_signing._signing.sign_sigstore.sigstore_models.Bundle", FakeBundle),
+        ("model_signing._signing.sign_sigstore.sigstore_verifier.Verifier.production", lambda: FakeVerifier()),
+        ("model_signing._signing.sign_sigstore.sigstore_verifier.Verifier.staging", lambda: FakeVerifier()),
+        ("model_signing._signing.sign_sigstore.sigstore_models.ClientTrustConfig.production", lambda: StubCfg()),
+        ("model_signing._signing.sign_sigstore.sigstore_models.ClientTrustConfig.staging", lambda: StubCfg()),
+    ]
+
+    ctx_stack = []
+    try:
+        # Enter all patches first
+        for target, repl in patch_specs:
+            ctx = patch(target, repl)
+            ctx_stack.append(ctx)
+            ctx.__enter__()
+
+        # Build fuzzed model/signature paths
+        with (
+            tempfile.TemporaryDirectory(prefix="mt_file_fuzz_") as tmpdir,
+            tempfile.TemporaryDirectory(prefix="mt_sig_fuzz_") as sigdir,
+        ):
+            root = Path(tmpdir)
+            create_fuzz_files(root, fdp)
+            if not any_files(root):
+                return
+
+            model_path = str(root)
+            sig_path = os.path.join(sigdir, "model.sig")
+
+            # Build configs after patches are active
+            signer_cfg = signing.Config().use_sigstore_signer(
+                oidc_issuer=oidc_url_str,           # fuzzed
+                use_staging=False,
+                use_ambient_credentials=use_ambient,
+                force_oob=True,
+            )
+
+            # --- sign ---
+            try:
+                signer_cfg.sign(model_path, sig_path)
+            except json.JSONDecodeError as e:
+                print(e)
+                # Ignore malformed JSON (e.g., if something wrote garbage to sig_path)
+                return
+            except ValueError as e:
+                print(e)
+                # Swallow only the in-toto type mismatch from model-transparency
+                if "Expected in-toto" in str(e):
+                    return
+                raise
+            except IdentityError as e:
+                print(e)
+                return
+
+            try:
+                # --- verify ---
+                verifier = verifying.Config().use_sigstore_verifier(
+                    identity=identity_hint,             # fuzzed
+                    oidc_issuer=oidc_url_str,          # fuzzed
+                    use_staging=False,
+                )
+                verifier.verify(model_path, sig_path)
+            except json.JSONDecodeError as e:
+                print(e)
+                # Ignore malformed bundle JSON during verification
+                return
 
     finally:
-        if tf is not None:
-            try:
-                os.unlink(tf.name)
-            except OSError:
-                pass
+        for ctx in reversed(ctx_stack):
+            try: ctx.__exit__(None, None, None)
+            except Exception: pass
+        try: embedded_store.cleanup()
+        except Exception: pass
 
-    with (
-        tempfile.TemporaryDirectory(prefix="mt_file_fuzz_") as tmpdir,
-        tempfile.TemporaryDirectory(prefix="mt_sig_fuzz_") as sigdir,
-    ):
-        root = Path(tmpdir)
-        create_fuzz_files(root, fdp)
-        # If there are NO files in root (skip empty directory cases).
-        if not any_files(root):
-            return
-
-        print("DID IT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        #identity_token = sigstore_oidc_beacon_token()
-        #sc = signing.Config()
-        #sc.use_sigstore_signer(
-        #    identity_token=identity_token,
-        #    for_fuzzing=True,
-        #    trusted_root_for_fuzzing=tr,
-        #)
-        signer = sigstore.Signer()
- 
-        signature_path = os.path.join(tmpdir, "model.sig")
-        print("signing")
-        try:
-            #sc.sign(model_path, signature_path)
-            signer.sign(model_path, signature_path)
-        except Exception as e:
-            print(e)
-            return
-
-        '''try:
-            print("verifying")
-            verifying.Config().use_sigstore_verifier(
-                identity=EXPECTED_IDENTITY,
-                oidc_issuer=EXPECTED_OIDC_ISSUER,
-                use_staging=True,
-            ).verify(model_path, signature_path)
-        except Exception as e:
-            print(e)
-            pass'''
-
-
-def main():
-    #atheris.instrument_all()
-    atheris.Setup(sys.argv, TestOneInput)
-    atheris.Fuzz()
-
+def TestOneInput(data: bytes) -> None:
+    _run_once_with_data(data)
 
 if __name__ == "__main__":
-    main()
-
+    atheris.instrument_all()
+    atheris.Setup(sys.argv, TestOneInput, enable_python_coverage=True)
+    atheris.Fuzz()

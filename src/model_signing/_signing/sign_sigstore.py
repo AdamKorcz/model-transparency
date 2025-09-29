@@ -113,14 +113,14 @@ class Signer(signing.Signer):
               that the client is public or the provider does not require a
               secret.
         """
-        if for_fuzzing:
-            self._signing_context = sigstore_signer.SigningContext(
-                fulcio=FulcioClient(url="xxx.com"),
-                rekor=RekorClient.staging(),
-                trusted_root=trusted_root_for_fuzzing,
-            )
-            self._issuer = sigstore_oidc.Issuer.staging()
-        elif use_staging:
+        #if for_fuzzing:
+        #    self._signing_context = sigstore_signer.SigningContext(
+        #        fulcio=FulcioClient(url="xxx.com"),
+        #        rekor=RekorClient.staging(),
+        #        trusted_root=trusted_root_for_fuzzing,
+        #    )
+        #    oidc_issuer = "test-issuer"
+        if use_staging:
             trust_config = sigstore_models.ClientTrustConfig.staging()
         else:
             trust_config = sigstore_models.ClientTrustConfig.production()
